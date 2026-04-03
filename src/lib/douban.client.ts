@@ -1,256 +1,91 @@
 import { DoubanItem, DoubanResult } from './types';
-import { getDoubanProxyUrl } from './utils';
 
-interface DoubanCategoriesParams {
-  kind: 'tv' | 'movie';
-  category: string;
-  type: string;
-  pageLimit?: number;
-  pageStart?: number;
-}
+/**
+ * EdgeOne 边缘函数代理地址
+ * 已部署在：https://douban-proxy-zone-3kq9qzv6e0jf-1393829787.eo-edgefunctions1.com
+ */
+const EDGE_PROXY_URL = 'https://douban-proxy-zone-3kq9qzv6e0jf-1393829787.eo-edgefunctions1.com';
 
-interface DoubanCategoryApiResponse {
-  total: number;
-  items: Array<{
-    id: string;
-    title: string;
-    card_subtitle: string;
-    pic: {
-      large: string;
-      normal: string;
-    };
-    rating: {
-      value: number;
-    };
-  }>;
+/**
+ * 封装经过边缘函数代理的 fetch 请求
+ * 自动处理 URL 编码并转发至 EdgeOne
+ */
+async function fetchViaProxy(doubanUrl: string): Promise<Response> {
+  // 将目标豆瓣 API 地址作为参数传给你的 EdgeOne 函数
+  const finalUrl = `${EDGE_PROXY_URL}/?url=${encodeURIComponent(doubanUrl)}`;
+
+  const response = await fetch(finalUrl, {
+    method: 'GET',
+    headers: {
+      'Accept': 'application/json',
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`代理请求失败: ${response.status} ${response.statusText}`);
+  }
+
+  return response;
 }
 
 /**
- * 带超时的 fetch 请求
+ * 获取豆瓣列表数据（使用移动端 H5 接口，最稳定）
+ * @param kind 'movie' 或 'tv'
+ * @param tag 类别标签（如 'hot', 'top250', 'action'）
  */
-const FALLBACK_CORS_PROXIES = [
-  'https://cors.isteed.cc/',
-  'https://cors.isteed.cc/https://',
-];
-
-async function fetchWithTimeout(
-  url: string,
-  options: RequestInit = {}
-): Promise<Response> {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 10000); // 10秒超时
-
-  // 检查是否使用代理
-  const proxyUrl = getDoubanProxyUrl();
-  const finalUrl = proxyUrl ? `${proxyUrl}${encodeURIComponent(url)}` : url;
-
-  const fetchOptions: RequestInit = {
-    ...options,
-    signal: controller.signal,
-    headers: {
-      // 浏览器受限请求头不强行设置，仅保留可允许的 Accept
-      Accept: 'application/json, text/plain, */*',
-      ...options.headers,
-    },
-  };
+export async function getDoubanList(
+  kind: 'movie' | 'tv',
+  tag: string,
+  limit = 20,
+  start = 0
+): Promise<DoubanResult> {
+  // 构造豆瓣移动端 H5 接口 URL
+  const target = `https://m.douban.com/rexxar/api/v2/subject_collection/filter_${kind}_${encodeURIComponent(tag)}/items?start=${start}&count=${limit}`;
 
   try {
-    let response = await fetch(finalUrl, fetchOptions);
-    clearTimeout(timeoutId);
+    const response = await fetchViaProxy(target);
+    const data = await response.json();
 
-    // 如果被 CORS 限制（opaque 或非 2xx），并且未设置自有代理，则尝试公共 CORS 代理作为兜底
-    if ((response.type === 'opaque' || !response.ok) && !proxyUrl) {
-      for (const px of FALLBACK_CORS_PROXIES) {
-        try {
-          const resp = await fetch(
-            px.endsWith('https://') ? `${px}${url.replace(/^https?:\/\//, '')}` : `${px}${url}`,
-            fetchOptions
-          );
-          if (resp.ok && resp.type !== 'opaque') {
-            response = resp;
-            break;
-          }
-        } catch (_) {
-          // 继续尝试下一个
-        }
-      }
-    }
+    // 适配移动端 H5 接口的 items 数据结构
+    const list: DoubanItem[] = (data.items || []).map((item: any) => ({
+      id: item.id,
+      title: item.title,
+      // 移动端接口图片字段为 pic.normal
+      poster: item.pic?.normal || item.pic?.large || '',
+      rate: item.rating?.value ? item.rating.value.toFixed(1) : '暂无评分',
+      // 从副标题中提取年份，如 "2024 / 美国 / 剧情"
+      year: item.year || item.card_subtitle?.match(/(\d{4})/)?.[1] || '',
+    }));
 
-    return response;
+    return {
+      code: 200,
+      message: '获取成功',
+      list: list,
+    };
   } catch (error) {
-    clearTimeout(timeoutId);
-    // fetch 直接抛错（如被 CORS 拦截或网络失败）时，尝试公共代理兜底
-    if (!proxyUrl) {
-      for (const px of FALLBACK_CORS_PROXIES) {
-        try {
-          const resp = await fetch(
-            px.endsWith('https://') ? `${px}${url.replace(/^https?:\/\//, '')}` : `${px}${url}`,
-            fetchOptions
-          );
-          if (resp.ok && resp.type !== 'opaque') {
-            return resp;
-          }
-        } catch (_) {
-          // 继续尝试下一个
-        }
-      }
+    // 触发全局错误提示逻辑
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('globalError', {
+          detail: { message: `获取豆瓣数据失败: ${(error as Error).message}` },
+        })
+      );
     }
     throw error;
   }
 }
 
 /**
- * 检查是否应该使用客户端获取豆瓣数据
+ * 兼容原有的分类获取函数
  */
-export function shouldUseDoubanClient(): boolean {
-  // 静态导出模式不提供服务端 API，统一使用客户端直连/代理
-  return true;
-}
-
-/**
- * 浏览器端豆瓣分类数据获取函数
- */
-export async function fetchDoubanCategories(
-  params: DoubanCategoriesParams
-): Promise<DoubanResult> {
-  const { kind, category, type, pageLimit = 20, pageStart = 0 } = params;
-
-  // 验证参数
-  if (!['tv', 'movie'].includes(kind)) {
-    throw new Error('kind 参数必须是 tv 或 movie');
-  }
-
-  if (!category || !type) {
-    throw new Error('category 和 type 参数不能为空');
-  }
-
-  if (pageLimit < 1 || pageLimit > 100) {
-    throw new Error('pageLimit 必须在 1-100 之间');
-  }
-
-  if (pageStart < 0) {
-    throw new Error('pageStart 不能小于 0');
-  }
-
-  const target = `https://m.douban.com/rexxar/api/v2/subject/recent_hot/${kind}?start=${pageStart}&limit=${pageLimit}&category=${category}&type=${type}`;
-
-  try {
-    const response = await fetchWithTimeout(target);
-
-    if (!response.ok) {
-      throw new Error(`HTTP error! Status: ${response.status}`);
-    }
-
-    const doubanData: DoubanCategoryApiResponse = await response.json();
-
-    // 转换数据格式
-    const list: DoubanItem[] = doubanData.items.map((item) => ({
-      id: item.id,
-      title: item.title,
-      poster: item.pic?.normal || item.pic?.large || '',
-      rate: item.rating?.value ? item.rating.value.toFixed(1) : '',
-      year: item.card_subtitle?.match(/(\d{4})/)?.[1] || '',
-    }));
-
-    return {
-      code: 200,
-      message: '获取成功',
-      list: list,
-    };
-  } catch (error) {
-    // 触发全局错误提示
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(
-        new CustomEvent('globalError', {
-          detail: { message: '获取豆瓣分类数据失败' },
-        })
-      );
-    }
-    throw new Error(`获取豆瓣分类数据失败: ${(error as Error).message}`);
-  }
-}
-
-/**
- * 统一的豆瓣分类数据获取函数，根据代理设置选择使用服务端 API 或客户端代理获取
- */
-export async function getDoubanCategories(
-  params: DoubanCategoriesParams
-): Promise<DoubanResult> {
-  // 统一走客户端直连/代理
-  return fetchDoubanCategories(params);
-}
-
-interface DoubanListParams {
-  tag: string;
+export async function getDoubanCategories(params: {
+  kind: 'tv' | 'movie';
+  category: string;
   type: string;
   pageLimit?: number;
   pageStart?: number;
-}
-
-export async function getDoubanList(
-  params: DoubanListParams
-): Promise<DoubanResult> {
-  const { tag, type, pageLimit = 20, pageStart = 0 } = params;
-  // 统一走客户端直连/代理
-  return fetchDoubanList(params);
-}
-
-export async function fetchDoubanList(
-  params: DoubanListParams
-): Promise<DoubanResult> {
-  const { tag, type, pageLimit = 20, pageStart = 0 } = params;
-
-  // 验证参数
-  if (!tag || !type) {
-    throw new Error('tag 和 type 参数不能为空');
-  }
-
-  if (!['tv', 'movie'].includes(type)) {
-    throw new Error('type 参数必须是 tv 或 movie');
-  }
-
-  if (pageLimit < 1 || pageLimit > 100) {
-    throw new Error('pageLimit 必须在 1-100 之间');
-  }
-
-  if (pageStart < 0) {
-    throw new Error('pageStart 不能小于 0');
-  }
-
-  const target = `https://movie.douban.com/j/search_subjects?type=${type}&tag=${tag}&sort=recommend&page_limit=${pageLimit}&page_start=${pageStart}`;
-
-  try {
-    const response = await fetchWithTimeout(target);
-
-    if (!response.ok) {
-      throw new Error(`HTTP error! Status: ${response.status}`);
-    }
-
-    const doubanData: DoubanCategoryApiResponse = await response.json();
-
-    // 转换数据格式
-    const list: DoubanItem[] = doubanData.items.map((item) => ({
-      id: item.id,
-      title: item.title,
-      poster: item.pic?.normal || item.pic?.large || '',
-      rate: item.rating?.value ? item.rating.value.toFixed(1) : '',
-      year: item.card_subtitle?.match(/(\d{4})/)?.[1] || '',
-    }));
-
-    return {
-      code: 200,
-      message: '获取成功',
-      list: list,
-    };
-  } catch (error) {
-    // 触发全局错误提示
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(
-        new CustomEvent('globalError', {
-          detail: { message: '获取豆瓣列表数据失败' },
-        })
-      );
-    }
-    throw new Error(`获取豆瓣分类数据失败: ${(error as Error).message}`);
-  }
+}): Promise<DoubanResult> {
+  const { kind, category, pageLimit = 20, pageStart = 0 } = params;
+  // 调用封装好的 H5 获取逻辑
+  return getDoubanList(kind, category, pageLimit, pageStart);
 }
