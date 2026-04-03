@@ -1,62 +1,256 @@
-// ... 前面部分保持不变 ...
+import { DoubanItem, DoubanResult } from './types';
+import { getDoubanProxyUrl } from './utils';
 
-const PROXY_BASE = 'https://db.gullu.cc.cd/api';
+interface DoubanCategoriesParams {
+  kind: 'tv' | 'movie';
+  category: string;
+  type: string;
+  pageLimit?: number;
+  pageStart?: number;
+}
 
-/**
- * 修正后的请求函数
- */
-async function fetchFromProxy(path: string): Promise<Response> {
-  // 确保 path 是以 / 开头，且不重复包含 /api
-  const cleanPath = path.startsWith('/') ? path : `/${path}`;
-  const finalUrl = `${PROXY_BASE}${cleanPath}`;
-  
-  return await fetch(finalUrl, {
-    method: 'GET',
-    headers: {
-      'Accept': 'application/json',
-      'Cache-Control': 'no-cache'
-    }
-  });
+interface DoubanCategoryApiResponse {
+  total: number;
+  items: Array<{
+    id: string;
+    title: string;
+    card_subtitle: string;
+    pic: {
+      large: string;
+      normal: string;
+    };
+    rating: {
+      value: number;
+    };
+  }>;
 }
 
 /**
- * 适配 Rexxar 接口的数据结构
+ * 带超时的 fetch 请求
+ */
+const FALLBACK_CORS_PROXIES = [
+  'https://cors.isteed.cc/',
+  'https://cors.isteed.cc/https://',
+];
+
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit = {}
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000); // 10秒超时
+
+  // 检查是否使用代理
+  const proxyUrl = getDoubanProxyUrl();
+  const finalUrl = proxyUrl ? `${proxyUrl}${encodeURIComponent(url)}` : url;
+
+  const fetchOptions: RequestInit = {
+    ...options,
+    signal: controller.signal,
+    headers: {
+      // 浏览器受限请求头不强行设置，仅保留可允许的 Accept
+      Accept: 'application/json, text/plain, */*',
+      ...options.headers,
+    },
+  };
+
+  try {
+    let response = await fetch(finalUrl, fetchOptions);
+    clearTimeout(timeoutId);
+
+    // 如果被 CORS 限制（opaque 或非 2xx），并且未设置自有代理，则尝试公共 CORS 代理作为兜底
+    if ((response.type === 'opaque' || !response.ok) && !proxyUrl) {
+      for (const px of FALLBACK_CORS_PROXIES) {
+        try {
+          const resp = await fetch(
+            px.endsWith('https://') ? `${px}${url.replace(/^https?:\/\//, '')}` : `${px}${url}`,
+            fetchOptions
+          );
+          if (resp.ok && resp.type !== 'opaque') {
+            response = resp;
+            break;
+          }
+        } catch (_) {
+          // 继续尝试下一个
+        }
+      }
+    }
+
+    return response;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    // fetch 直接抛错（如被 CORS 拦截或网络失败）时，尝试公共代理兜底
+    if (!proxyUrl) {
+      for (const px of FALLBACK_CORS_PROXIES) {
+        try {
+          const resp = await fetch(
+            px.endsWith('https://') ? `${px}${url.replace(/^https?:\/\//, '')}` : `${px}${url}`,
+            fetchOptions
+          );
+          if (resp.ok && resp.type !== 'opaque') {
+            return resp;
+          }
+        } catch (_) {
+          // 继续尝试下一个
+        }
+      }
+    }
+    throw error;
+  }
+}
+
+/**
+ * 检查是否应该使用客户端获取豆瓣数据
+ */
+export function shouldUseDoubanClient(): boolean {
+  // 静态导出模式不提供服务端 API，统一使用客户端直连/代理
+  return true;
+}
+
+/**
+ * 浏览器端豆瓣分类数据获取函数
  */
 export async function fetchDoubanCategories(
   params: DoubanCategoriesParams
 ): Promise<DoubanResult> {
-  const { kind, category, type, pageLimit = 18, pageStart = 0 } = params;
+  const { kind, category, type, pageLimit = 20, pageStart = 0 } = params;
 
-  // Rexxar 接口通常需要 apikey，如果边缘函数没处理，这里得补上
-  // 这里先尝试不带 apikey 的标准路径
-  const path = `/rexxar/api/v2/subject/recent_hot/${kind}?start=${pageStart}&count=${pageLimit}&category=${category}&type=${type}`;
+  // 验证参数
+  if (!['tv', 'movie'].includes(kind)) {
+    throw new Error('kind 参数必须是 tv 或 movie');
+  }
+
+  if (!category || !type) {
+    throw new Error('category 和 type 参数不能为空');
+  }
+
+  if (pageLimit < 1 || pageLimit > 100) {
+    throw new Error('pageLimit 必须在 1-100 之间');
+  }
+
+  if (pageStart < 0) {
+    throw new Error('pageStart 不能小于 0');
+  }
+
+  const target = `https://m.douban.com/rexxar/api/v2/subject/recent_hot/${kind}?start=${pageStart}&limit=${pageLimit}&category=${category}&type=${type}`;
 
   try {
-    const response = await fetchFromProxy(path);
-    
-    // 如果返回的不是 JSON，打印出来看具体错误
-    const contentType = response.headers.get("content-type");
-    if (!contentType || !contentType.includes("application/json")) {
-      const text = await response.text();
-      console.error("代理返回了非 JSON 内容:", text.substring(0, 100));
-      throw new Error("接口返回格式错误，请检查边缘函数路由");
+    const response = await fetchWithTimeout(target);
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! Status: ${response.status}`);
     }
 
-    const data = await response.json();
-    // 兼容多种返回结构
-    const rawList = data.subject_collection_items || data.items || data.subjects || [];
+    const doubanData: DoubanCategoryApiResponse = await response.json();
 
-    const list: DoubanItem[] = rawList.map((item: any) => ({
+    // 转换数据格式
+    const list: DoubanItem[] = doubanData.items.map((item) => ({
       id: item.id,
       title: item.title,
-      poster: getProxyImageUrl(item.cover?.url || item.pic?.normal || item.cover || ''),
-      rate: item.rating?.value ? item.rating.value.toFixed(1) : (item.rate || ''),
-      year: item.year || item.card_subtitle?.match(/(\d{4})/)?.[1] || '',
+      poster: item.pic?.normal || item.pic?.large || '',
+      rate: item.rating?.value ? item.rating.value.toFixed(1) : '',
+      year: item.card_subtitle?.match(/(\d{4})/)?.[1] || '',
     }));
 
-    return { code: 200, message: '获取成功', list };
+    return {
+      code: 200,
+      message: '获取成功',
+      list: list,
+    };
   } catch (error) {
-    console.error('获取豆瓣分类失败:', error);
-    throw error;
+    // 触发全局错误提示
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('globalError', {
+          detail: { message: '获取豆瓣分类数据失败' },
+        })
+      );
+    }
+    throw new Error(`获取豆瓣分类数据失败: ${(error as Error).message}`);
+  }
+}
+
+/**
+ * 统一的豆瓣分类数据获取函数，根据代理设置选择使用服务端 API 或客户端代理获取
+ */
+export async function getDoubanCategories(
+  params: DoubanCategoriesParams
+): Promise<DoubanResult> {
+  // 统一走客户端直连/代理
+  return fetchDoubanCategories(params);
+}
+
+interface DoubanListParams {
+  tag: string;
+  type: string;
+  pageLimit?: number;
+  pageStart?: number;
+}
+
+export async function getDoubanList(
+  params: DoubanListParams
+): Promise<DoubanResult> {
+  const { tag, type, pageLimit = 20, pageStart = 0 } = params;
+  // 统一走客户端直连/代理
+  return fetchDoubanList(params);
+}
+
+export async function fetchDoubanList(
+  params: DoubanListParams
+): Promise<DoubanResult> {
+  const { tag, type, pageLimit = 20, pageStart = 0 } = params;
+
+  // 验证参数
+  if (!tag || !type) {
+    throw new Error('tag 和 type 参数不能为空');
+  }
+
+  if (!['tv', 'movie'].includes(type)) {
+    throw new Error('type 参数必须是 tv 或 movie');
+  }
+
+  if (pageLimit < 1 || pageLimit > 100) {
+    throw new Error('pageLimit 必须在 1-100 之间');
+  }
+
+  if (pageStart < 0) {
+    throw new Error('pageStart 不能小于 0');
+  }
+
+  const target = `https://movie.douban.com/j/search_subjects?type=${type}&tag=${tag}&sort=recommend&page_limit=${pageLimit}&page_start=${pageStart}`;
+
+  try {
+    const response = await fetchWithTimeout(target);
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! Status: ${response.status}`);
+    }
+
+    const doubanData: DoubanCategoryApiResponse = await response.json();
+
+    // 转换数据格式
+    const list: DoubanItem[] = doubanData.items.map((item) => ({
+      id: item.id,
+      title: item.title,
+      poster: item.pic?.normal || item.pic?.large || '',
+      rate: item.rating?.value ? item.rating.value.toFixed(1) : '',
+      year: item.card_subtitle?.match(/(\d{4})/)?.[1] || '',
+    }));
+
+    return {
+      code: 200,
+      message: '获取成功',
+      list: list,
+    };
+  } catch (error) {
+    // 触发全局错误提示
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('globalError', {
+          detail: { message: '获取豆瓣列表数据失败' },
+        })
+      );
+    }
+    throw new Error(`获取豆瓣分类数据失败: ${(error as Error).message}`);
   }
 }
