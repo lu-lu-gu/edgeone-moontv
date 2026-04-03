@@ -9,91 +9,70 @@ interface DoubanCategoriesParams {
 }
 
 interface DoubanCategoryApiResponse {
-  total: number;
-  items: Array<{
-    id: string;
-    title: string;
-    card_subtitle: string;
-    pic: {
-      large: string;
-      normal: string;
-    };
-    rating: {
-      value: number;
-    };
-  }>;
+  subjects?: any[];
+  subject_collection_items?: any[];
+  items?: any[];
 }
 
 /**
- * EdgeOne 代理基础地址
- * 必须以 /api 结尾以匹配你的边缘函数路由规则
+ * 核心配置：使用你自己的生产代理地址
  */
 const PROXY_BASE = 'https://db.gullu.cc.cd/api';
 
 /**
- * 统一的 fetch 请求封装
+ * 辅助函数：将豆瓣原始图片 URL 转换为代理 URL，解决 418 错误
  */
-async function fetchWithTimeout(
-  url: string,
-  options: RequestInit = {}
-): Promise<Response> {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 10000);
-
-  try {
-    const response = await fetch(url, {
-      ...options,
-      signal: controller.signal,
-      headers: {
-        'Accept': 'application/json',
-        ...options.headers,
-      },
-    });
-    clearTimeout(timeoutId);
-    return response;
-  } catch (error) {
-    clearTimeout(timeoutId);
-    throw error;
-  }
+function getProxyImageUrl(originalUrl: string): string {
+  if (!originalUrl) return '';
+  // 转换格式示例: https://db.gullu.cc.cd/api/img/img9.doubanio.com/...
+  return `${PROXY_BASE}/img/${originalUrl.replace(/^https?:\/\//, '')}`;
 }
 
 /**
- * 获取豆瓣分类数据 (Rexxar 接口)
+ * 通用请求函数
  */
+async function fetchFromProxy(path: string): Promise<Response> {
+  // 拼接完整的代理请求地址
+  const finalUrl = `${PROXY_BASE}${path}`;
+  
+  return await fetch(finalUrl, {
+    method: 'GET',
+    headers: {
+      'Accept': 'application/json',
+    }
+  });
+}
+
 export async function fetchDoubanCategories(
   params: DoubanCategoriesParams
 ): Promise<DoubanResult> {
-  const { kind, category, type, pageLimit = 20, pageStart = 0 } = params;
+  const { kind, category, type, pageLimit = 18, pageStart = 0 } = params;
 
-  // 构造子路径。边缘函数 [[path]].js 会自动识别并补全 /rexxar/api/v2
-  const subPath = `/rexxar/api/v2/subject/recent_hot/${kind}?start=${pageStart}&limit=${pageLimit}&category=${category}&type=${type}`;
-  const target = `${PROXY_BASE}${subPath}`;
+  // 使用 Rexxar 接口路径
+  const path = `/rexxar/api/v2/subject/recent_hot/${kind}?start=${pageStart}&count=${pageLimit}&category=${category}&type=${type}`;
 
   try {
-    const response = await fetchWithTimeout(target);
+    const response = await fetchFromProxy(path);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-    if (!response.ok) {
-      throw new Error(`HTTP error! Status: ${response.status}`);
-    }
+    const data: DoubanCategoryApiResponse = await response.json();
+    
+    // 兼容多种返回字段
+    const rawList = data.subject_collection_items || data.items || data.subjects || [];
 
-    const doubanData: DoubanCategoryApiResponse = await response.json();
-
-    const list: DoubanItem[] = doubanData.items.map((item) => ({
+    const list: DoubanItem[] = rawList.map((item: any) => ({
       id: item.id,
       title: item.title,
-      // 注意：图片显示需要 index.html 中有 <meta name="referrer" content="no-referrer">
-      poster: item.pic?.normal || item.pic?.large || '',
-      rate: item.rating?.value ? item.rating.value.toFixed(1) : '暂无',
-      year: item.card_subtitle?.match(/(\d{4})/)?.[1] || '',
+      // 使用图片代理解决 418 问题
+      poster: getProxyImageUrl(item.cover?.url || item.pic?.normal || item.cover || ''),
+      rate: item.rating?.value ? item.rating.value.toFixed(1) : (item.rate || ''),
+      year: item.year || item.card_subtitle?.match(/(\d{4})/)?.[1] || '',
     }));
 
-    return {
-      code: 200,
-      message: '获取成功',
-      list: list,
-    };
+    return { code: 200, message: '获取成功', list };
   } catch (error) {
-    throw new Error(`获取豆瓣分类数据失败: ${(error as Error).message}`);
+    console.error('获取豆瓣分类失败:', error);
+    throw error;
   }
 }
 
@@ -105,46 +84,40 @@ interface DoubanListParams {
 }
 
 /**
- * 获取豆瓣列表数据 (搜索/标签接口)
+ * 获取搜索/标签列表 (PC 网页版接口转发)
  */
 export async function fetchDoubanList(
   params: DoubanListParams
 ): Promise<DoubanResult> {
-  const { tag, type, pageLimit = 20, pageStart = 0 } = params;
+  const { tag, type, pageLimit = 18, pageStart = 0 } = params;
 
-  // 构造搜索接口子路径
-  const subPath = `/j/search_subjects?type=${type}&tag=${tag}&sort=recommend&page_limit=${pageLimit}&page_start=${pageStart}`;
-  const target = `${PROXY_BASE}${subPath}`;
+  // 使用 PC 网页版搜索接口路径
+  const path = `/j/search_subjects?type=${type}&tag=${encodeURIComponent(tag)}&page_limit=${pageLimit}&page_start=${pageStart}`;
 
   try {
-    const response = await fetchWithTimeout(target);
+    const response = await fetchFromProxy(path);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-    if (!response.ok) {
-      throw new Error(`HTTP error! Status: ${response.status}`);
-    }
+    const data: DoubanCategoryApiResponse = await response.json();
+    const rawList = data.subjects || [];
 
-    const doubanData: any = await response.json();
-    const rawItems = doubanData.subjects || doubanData.items || [];
-
-    const list: DoubanItem[] = rawItems.map((item: any) => ({
+    const list: DoubanItem[] = rawList.map((item: any) => ({
       id: item.id,
       title: item.title,
-      poster: item.cover || item.pic?.normal || '',
-      rate: item.rate || item.rating?.value?.toFixed(1) || '暂无',
+      // 同样通过代理加载图片
+      poster: getProxyImageUrl(item.cover || ''),
+      rate: item.rate || '',
       year: '',
     }));
 
-    return {
-      code: 200,
-      message: '获取成功',
-      list: list,
-    };
+    return { code: 200, message: '获取成功', list };
   } catch (error) {
-    throw new Error(`获取豆瓣列表数据失败: ${(error as Error).message}`);
+    console.error('获取豆瓣列表失败:', error);
+    throw error;
   }
 }
 
-// 导出统一接口
+// 导出统一调用接口
 export const getDoubanCategories = fetchDoubanCategories;
 export const getDoubanList = fetchDoubanList;
-export function shouldUseDoubanClient(): boolean { return true; }
+export const shouldUseDoubanClient = () => true;
