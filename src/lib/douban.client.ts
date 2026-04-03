@@ -10,9 +10,17 @@ const EDGE_PROXY_URL = 'https://douban-proxy-zone-3kq9qzv6e0jf-1393829787.eo-edg
  * 封装经过边缘函数代理的 fetch 请求
  * 自动处理 URL 编码并转发至 EdgeOne
  */
+/**
+ * 修改后的代理请求封装
+ */
 async function fetchViaProxy(doubanUrl: string): Promise<Response> {
-  // 将目标豆瓣 API 地址作为参数传给你的 EdgeOne 函数
+  // 1. 使用你提供的新 EdgeOne 域名
+  const EDGE_PROXY_URL = 'https://douban-proxy-zone-3kq9qzv6e0jf-1393829787.eo-edgefunctions1.com';
+  
+  // 2. 修正拼接逻辑：确保域名后面有 / 且参数名为 url
   const finalUrl = `${EDGE_PROXY_URL}/?url=${encodeURIComponent(doubanUrl)}`;
+
+  console.log('正在请求代理地址:', finalUrl); // 用于调试，确认 URL 格式正确
 
   const response = await fetch(finalUrl, {
     method: 'GET',
@@ -22,10 +30,44 @@ async function fetchViaProxy(doubanUrl: string): Promise<Response> {
   });
 
   if (!response.ok) {
-    throw new Error(`代理请求失败: ${response.status} ${response.statusText}`);
+    throw new Error(`边缘代理响应异常: ${response.status}`);
   }
 
   return response;
+}
+
+/**
+ * 获取分类数据的核心逻辑保持如下
+ */
+export async function fetchDoubanCategories(params: any): Promise<DoubanResult> {
+  const { kind, category, type, pageLimit = 20, pageStart = 0 } = params;
+  
+  // 构造豆瓣原始 H5 接口
+  const target = `https://m.douban.com/rexxar/api/v2/subject/recent_hot/${kind}?start=${pageStart}&limit=${pageLimit}&category=${encodeURIComponent(category)}&type=${encodeURIComponent(type)}`;
+
+  try {
+    const response = await fetchViaProxy(target);
+    const data = await response.json();
+    
+    // ... 后续转换逻辑保持不变
+    const list: DoubanItem[] = (data.items || []).map((item: any) => ({
+      id: item.id,
+      title: item.title,
+      poster: item.pic?.normal || item.pic?.large || '',
+      rate: item.rating?.value ? item.rating.value.toFixed(1) : '',
+      year: item.card_subtitle?.match(/(\d{4})/)?.[1] || '',
+    }));
+
+    return { code: 200, message: '获取成功', list };
+  } catch (error) {
+    // 触发错误提示
+    if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('globalError', {
+          detail: { message: '获取豆瓣分类数据失败，请检查代理配置' },
+        }));
+    }
+    throw error;
+  }
 }
 
 /**
