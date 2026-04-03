@@ -1,5 +1,4 @@
 import { DoubanItem, DoubanResult } from './types';
-import { getDoubanProxyUrl } from './utils';
 
 interface DoubanCategoriesParams {
   kind: 'tv' | 'movie';
@@ -26,13 +25,13 @@ interface DoubanCategoryApiResponse {
 }
 
 /**
+ * EdgeOne 代理配置
+ */
+const PROXY_BASE = 'https://db.gullu.cc.cd/api';
+
+/**
  * 带超时的 fetch 请求
  */
-const FALLBACK_CORS_PROXIES = [
-  'https://cors.isteed.cc/',
-  'https://cors.isteed.cc/https://',
-];
-
 async function fetchWithTimeout(
   url: string,
   options: RequestInit = {}
@@ -40,99 +39,36 @@ async function fetchWithTimeout(
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000); // 10秒超时
 
-  // 检查是否使用代理
-  const proxyUrl = getDoubanProxyUrl();
-  const finalUrl = proxyUrl ? `${proxyUrl}${encodeURIComponent(url)}` : url;
-
-  const fetchOptions: RequestInit = {
-    ...options,
-    signal: controller.signal,
-    headers: {
-      // 浏览器受限请求头不强行设置，仅保留可允许的 Accept
-      Accept: 'application/json, text/plain, */*',
-      ...options.headers,
-    },
-  };
-
   try {
-    let response = await fetch(finalUrl, fetchOptions);
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        'Accept': 'application/json, text/plain, */*',
+        ...options.headers,
+      },
+    });
     clearTimeout(timeoutId);
-
-    // 如果被 CORS 限制（opaque 或非 2xx），并且未设置自有代理，则尝试公共 CORS 代理作为兜底
-    if ((response.type === 'opaque' || !response.ok) && !proxyUrl) {
-      for (const px of FALLBACK_CORS_PROXIES) {
-        try {
-          const resp = await fetch(
-            px.endsWith('https://') ? `${px}${url.replace(/^https?:\/\//, '')}` : `${px}${url}`,
-            fetchOptions
-          );
-          if (resp.ok && resp.type !== 'opaque') {
-            response = resp;
-            break;
-          }
-        } catch (_) {
-          // 继续尝试下一个
-        }
-      }
-    }
-
     return response;
   } catch (error) {
     clearTimeout(timeoutId);
-    // fetch 直接抛错（如被 CORS 拦截或网络失败）时，尝试公共代理兜底
-    if (!proxyUrl) {
-      for (const px of FALLBACK_CORS_PROXIES) {
-        try {
-          const resp = await fetch(
-            px.endsWith('https://') ? `${px}${url.replace(/^https?:\/\//, '')}` : `${px}${url}`,
-            fetchOptions
-          );
-          if (resp.ok && resp.type !== 'opaque') {
-            return resp;
-          }
-        } catch (_) {
-          // 继续尝试下一个
-        }
-      }
-    }
     throw error;
   }
 }
 
 /**
- * 检查是否应该使用客户端获取豆瓣数据
- */
-export function shouldUseDoubanClient(): boolean {
-  // 静态导出模式不提供服务端 API，统一使用客户端直连/代理
-  return true;
-}
-
-/**
- * 浏览器端豆瓣分类数据获取函数
+ * 浏览器端豆瓣分类数据获取函数 (Rexxar API)
  */
 export async function fetchDoubanCategories(
   params: DoubanCategoriesParams
 ): Promise<DoubanResult> {
   const { kind, category, type, pageLimit = 20, pageStart = 0 } = params;
 
-  // 验证参数
-  if (!['tv', 'movie'].includes(kind)) {
-    throw new Error('kind 参数必须是 tv 或 movie');
-  }
-
-  if (!category || !type) {
-    throw new Error('category 和 type 参数不能为空');
-  }
-
-  if (pageLimit < 1 || pageLimit > 100) {
-    throw new Error('pageLimit 必须在 1-100 之间');
-  }
-
-  if (pageStart < 0) {
-    throw new Error('pageStart 不能小于 0');
-  }
-
-  const target = `https://m.douban.com/rexxar/api/v2/subject/recent_hot/${kind}?start=${pageStart}&limit=${pageLimit}&category=${category}&type=${type}`;
+  // 1. 构造豆瓣原始子路径
+  const subPath = `/rexxar/api/v2/subject/recent_hot/${kind}?start=${pageStart}&limit=${pageLimit}&category=${category}&type=${type}`;
+  
+  // 2. 拼接代理地址
+  const target = `${PROXY_BASE}${subPath}`;
 
   try {
     const response = await fetchWithTimeout(target);
@@ -143,7 +79,6 @@ export async function fetchDoubanCategories(
 
     const doubanData: DoubanCategoryApiResponse = await response.json();
 
-    // 转换数据格式
     const list: DoubanItem[] = doubanData.items.map((item) => ({
       id: item.id,
       title: item.title,
@@ -158,7 +93,6 @@ export async function fetchDoubanCategories(
       list: list,
     };
   } catch (error) {
-    // 触发全局错误提示
     if (typeof window !== 'undefined') {
       window.dispatchEvent(
         new CustomEvent('globalError', {
@@ -170,16 +104,6 @@ export async function fetchDoubanCategories(
   }
 }
 
-/**
- * 统一的豆瓣分类数据获取函数，根据代理设置选择使用服务端 API 或客户端代理获取
- */
-export async function getDoubanCategories(
-  params: DoubanCategoriesParams
-): Promise<DoubanResult> {
-  // 统一走客户端直连/代理
-  return fetchDoubanCategories(params);
-}
-
 interface DoubanListParams {
   tag: string;
   type: string;
@@ -187,37 +111,20 @@ interface DoubanListParams {
   pageStart?: number;
 }
 
-export async function getDoubanList(
-  params: DoubanListParams
-): Promise<DoubanResult> {
-  const { tag, type, pageLimit = 20, pageStart = 0 } = params;
-  // 统一走客户端直连/代理
-  return fetchDoubanList(params);
-}
-
+/**
+ * 豆瓣搜索列表获取函数 (Search API)
+ */
 export async function fetchDoubanList(
   params: DoubanListParams
 ): Promise<DoubanResult> {
   const { tag, type, pageLimit = 20, pageStart = 0 } = params;
 
-  // 验证参数
-  if (!tag || !type) {
-    throw new Error('tag 和 type 参数不能为空');
-  }
-
-  if (!['tv', 'movie'].includes(type)) {
-    throw new Error('type 参数必须是 tv 或 movie');
-  }
-
-  if (pageLimit < 1 || pageLimit > 100) {
-    throw new Error('pageLimit 必须在 1-100 之间');
-  }
-
-  if (pageStart < 0) {
-    throw new Error('pageStart 不能小于 0');
-  }
-
-  const target = `https://movie.douban.com/j/search_subjects?type=${type}&tag=${tag}&sort=recommend&page_limit=${pageLimit}&page_start=${pageStart}`;
+  // 1. 构造搜索接口子路径
+  // 注意：边缘函数 [[path]].js 会自动识别并在缺少时补全 /rexxar/api/v2
+  const subPath = `/j/search_subjects?type=${type}&tag=${tag}&sort=recommend&page_limit=${pageLimit}&page_start=${pageStart}`;
+  
+  // 2. 拼接代理地址
+  const target = `${PROXY_BASE}${subPath}`;
 
   try {
     const response = await fetchWithTimeout(target);
@@ -226,15 +133,17 @@ export async function fetchDoubanList(
       throw new Error(`HTTP error! Status: ${response.status}`);
     }
 
-    const doubanData: DoubanCategoryApiResponse = await response.json();
+    const doubanData: any = await response.json();
+    
+    // 兼容 search_subjects 返回的 subjects 字段或 items 字段
+    const rawItems = doubanData.subjects || doubanData.items || [];
 
-    // 转换数据格式
-    const list: DoubanItem[] = doubanData.items.map((item) => ({
+    const list: DoubanItem[] = rawItems.map((item: any) => ({
       id: item.id,
       title: item.title,
-      poster: item.pic?.normal || item.pic?.large || '',
-      rate: item.rating?.value ? item.rating.value.toFixed(1) : '',
-      year: item.card_subtitle?.match(/(\d{4})/)?.[1] || '',
+      poster: item.cover || item.pic?.normal || '',
+      rate: item.rate || item.rating?.value?.toFixed(1) || '',
+      year: '', // 搜索接口通常不直接返回年份
     }));
 
     return {
@@ -243,7 +152,6 @@ export async function fetchDoubanList(
       list: list,
     };
   } catch (error) {
-    // 触发全局错误提示
     if (typeof window !== 'undefined') {
       window.dispatchEvent(
         new CustomEvent('globalError', {
@@ -251,6 +159,21 @@ export async function fetchDoubanList(
         })
       );
     }
-    throw new Error(`获取豆瓣分类数据失败: ${(error as Error).message}`);
+    throw new Error(`获取豆瓣列表数据失败: ${(error as Error).message}`);
   }
+}
+
+/**
+ * 统一封装函数
+ */
+export async function getDoubanCategories(params: DoubanCategoriesParams): Promise<DoubanResult> {
+  return fetchDoubanCategories(params);
+}
+
+export async function getDoubanList(params: DoubanListParams): Promise<DoubanResult> {
+  return fetchDoubanList(params);
+}
+
+export function shouldUseDoubanClient(): boolean {
+  return true;
 }
