@@ -31,6 +31,8 @@ export async function generateMetadata(): Promise<Metadata> {
     title: siteName,
     description: '影视聚合',
     manifest: '/manifest.json',
+    // 另一种 Next.js 推荐的设置 referrer 的方式（可选）
+    referrer: 'no-referrer', 
   };
 }
 
@@ -97,6 +99,9 @@ export default async function RootLayout({
           name='viewport'
           content='width=device-width, initial-scale=1.0, viewport-fit=cover'
         />
+        {/* 核心修改：添加此标签以解决豆瓣海报 418 拦截问题 */}
+        <meta name="referrer" content="no-referrer" />
+        
         {/* 将配置序列化后直接写入脚本，浏览器端可通过 window.RUNTIME_CONFIG 获取 */}
         {/* eslint-disable-next-line @next/next/no-sync-scripts */}
         <script
