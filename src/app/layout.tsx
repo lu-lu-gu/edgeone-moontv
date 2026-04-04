@@ -16,7 +16,7 @@ import { ThemeProvider } from '../components/ThemeProvider';
 
 const inter = Inter({ subsets: ['latin'] });
 
-// 动态生成 metadata，支持配置更新后的标题变化
+// 动态生成 metadata
 export async function generateMetadata(): Promise<Metadata> {
   let siteName = process.env.SITE_NAME || 'MoonTV';
   if (
@@ -31,8 +31,6 @@ export async function generateMetadata(): Promise<Metadata> {
     title: siteName,
     description: '影视聚合',
     manifest: '/manifest.json',
-    // 另一种 Next.js 推荐的设置 referrer 的方式（可选）
-    referrer: 'no-referrer', 
   };
 }
 
@@ -81,7 +79,6 @@ export default async function RootLayout({
     }));
   }
 
-  // 将运行时配置注入到全局 window 对象，供客户端在运行时读取
   const runtimeConfig = {
     STORAGE_TYPE: process.env.NEXT_PUBLIC_STORAGE_TYPE || 'localstorage',
     ENABLE_REGISTER: enableRegister,
@@ -99,11 +96,9 @@ export default async function RootLayout({
           name='viewport'
           content='width=device-width, initial-scale=1.0, viewport-fit=cover'
         />
-        {/* 核心修改：添加此标签以解决豆瓣海报 418 拦截问题 */}
+        {/* 核心修改：添加此行以解决豆瓣图片 418 拦截 */}
         <meta name="referrer" content="no-referrer" />
         
-        {/* 将配置序列化后直接写入脚本，浏览器端可通过 window.RUNTIME_CONFIG 获取 */}
-        {/* eslint-disable-next-line @next/next/no-sync-scripts */}
         <script
           dangerouslySetInnerHTML={{
             __html: `window.RUNTIME_CONFIG = ${JSON.stringify(runtimeConfig)};`,
