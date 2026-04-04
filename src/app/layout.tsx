@@ -16,7 +16,7 @@ import { ThemeProvider } from '../components/ThemeProvider';
 
 const inter = Inter({ subsets: ['latin'] });
 
-// 动态生成 metadata
+// 动态生成 metadata，支持配置更新后的标题变化
 export async function generateMetadata(): Promise<Metadata> {
   let siteName = process.env.SITE_NAME || 'MoonTV';
   if (
@@ -79,6 +79,7 @@ export default async function RootLayout({
     }));
   }
 
+  // 将运行时配置注入到全局 window 对象，供客户端在运行时读取
   const runtimeConfig = {
     STORAGE_TYPE: process.env.NEXT_PUBLIC_STORAGE_TYPE || 'localstorage',
     ENABLE_REGISTER: enableRegister,
@@ -96,9 +97,11 @@ export default async function RootLayout({
           name='viewport'
           content='width=device-width, initial-scale=1.0, viewport-fit=cover'
         />
-        {/* 核心修改：添加此行以解决豆瓣图片 418 拦截 */}
+        {/* 新增修改：添加 no-referrer 元标签以绕过豆瓣图片防盗链拦截（解决 418 错误） */}
         <meta name="referrer" content="no-referrer" />
         
+        {/* 将配置序列化后直接写入脚本，浏览器端可通过 window.RUNTIME_CONFIG 获取 */}
+        {/* eslint-disable-next-line @next/next/no-sync-scripts */}
         <script
           dangerouslySetInnerHTML={{
             __html: `window.RUNTIME_CONFIG = ${JSON.stringify(runtimeConfig)};`,
