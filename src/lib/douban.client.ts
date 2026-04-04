@@ -1,7 +1,7 @@
 import { DoubanItem, DoubanResult } from './types';
 
 // 你的 EdgeOne 边缘函数地址
-const EDGE_PROXY_BASE = 'https://douban-proxy-zone-3kq9qzv6e0jf-1393829787.eo-edgefunctions1.com';
+const EDGE_PROXY_BASE = 'https://db.gullu.cc.cd';
 
 interface DoubanCategoriesParams {
   kind: 'tv' | 'movie';
