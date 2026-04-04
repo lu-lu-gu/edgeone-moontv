@@ -1,7 +1,7 @@
 import { DoubanItem, DoubanResult } from './types';
 
 // 你的 EdgeOne 边缘函数地址
-const EDGE_PROXY_BASE = 'https://db.gullu.cc.cd';
+const EDGE_PROXY_BASE = 'https://db.gullu.cc.cd/api/douban';
 
 interface DoubanCategoriesParams {
   kind: 'tv' | 'movie';
