@@ -1,10 +1,5 @@
 import { DoubanItem, DoubanResult } from './types';
-
-// ==================== 配置区 ====================
-// 修正后的数据与图片代理基础域（移除旧版的代理地址拼凑）
-const EDGE_API_BASE = 'https://doubandali.gullu.cc.cd/api/';
-const EDGE_IMG_BASE = 'https://doubandali.gullu.cc.cd/img/';
-// ===============================================
+import { getDoubanProxyUrl } from './utils';
 
 interface DoubanCategoriesParams {
   kind: 'tv' | 'movie';
@@ -31,130 +26,231 @@ interface DoubanCategoryApiResponse {
 }
 
 /**
- * 封装经过 EdgeOne 路径透明代理的请求
- * 格式转换：https://m.douban.com/rexxar/api/... -> ${EDGE_API_BASE}/rexxar/api/...
+ * 带超时的 fetch 请求
  */
-async function fetchWithEdgeProxy(targetUrl: string): Promise<Response> {
-  // 将原豆瓣移动端主域名，直接替换成我们的 EdgeOne 数据代理前缀
-  const finalUrl = targetUrl.replace('https://m.douban.com/rexxar/api', EDGE_API_BASE);
+const FALLBACK_CORS_PROXIES = [
+  'https://cors.isteed.cc/',
+  'https://cors.isteed.cc/https://',
+];
 
-  const response = await fetch(finalUrl, {
-    method: 'GET',
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit = {}
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000); // 10秒超时
+
+  // 检查是否使用代理
+  const proxyUrl = getDoubanProxyUrl();
+  const finalUrl = proxyUrl ? `${proxyUrl}${encodeURIComponent(url)}` : url;
+
+  const fetchOptions: RequestInit = {
+    ...options,
+    signal: controller.signal,
     headers: {
-      'Accept': 'application/json, text/plain, */*',
+      // 浏览器受限请求头不强行设置，仅保留可允许的 Accept
+      Accept: 'application/json, text/plain, */*',
+      ...options.headers,
     },
-  });
+  };
 
-  if (!response.ok) {
-    throw new Error(`边缘函数代理请求失败: ${response.status}`);
+  try {
+    let response = await fetch(finalUrl, fetchOptions);
+    clearTimeout(timeoutId);
+
+    // 如果被 CORS 限制（opaque 或非 2xx），并且未设置自有代理，则尝试公共 CORS 代理作为兜底
+    if ((response.type === 'opaque' || !response.ok) && !proxyUrl) {
+      for (const px of FALLBACK_CORS_PROXIES) {
+        try {
+          const resp = await fetch(
+            px.endsWith('https://') ? `${px}${url.replace(/^https?:\/\//, '')}` : `${px}${url}`,
+            fetchOptions
+          );
+          if (resp.ok && resp.type !== 'opaque') {
+            response = resp;
+            break;
+          }
+        } catch (_) {
+          // 继续尝试下一个
+        }
+      }
+    }
+
+    return response;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    // fetch 直接抛错（如被 CORS 拦截或网络失败）时，尝试公共代理兜底
+    if (!proxyUrl) {
+      for (const px of FALLBACK_CORS_PROXIES) {
+        try {
+          const resp = await fetch(
+            px.endsWith('https://') ? `${px}${url.replace(/^https?:\/\//, '')}` : `${px}${url}`,
+            fetchOptions
+          );
+          if (resp.ok && resp.type !== 'opaque') {
+            return resp;
+          }
+        } catch (_) {
+          // 继续尝试下一个
+        }
+      }
+    }
+    throw error;
   }
-
-  return response;
 }
 
 /**
- * 助手函数：将豆瓣原始图片 URL 转换为走 EdgeOne 30天强缓存的代理 URL
- * 兼容系统拼接，进行完整的 UrlEncode 编码
+ * 检查是否应该使用客户端获取豆瓣数据
  */
-function proxyPosterUrl(originalUrl: string): string {
-  if (!originalUrl) return '';
-  // 转换为：https://doubandali.gullu.cc.cd/img/https%3A%2F%2Fimg9.doubanio.com%2F...
-  return `${EDGE_IMG_BASE}${encodeURIComponent(originalUrl)}`;
+export function shouldUseDoubanClient(): boolean {
+  // 静态导出模式不提供服务端 API，统一使用客户端直连/代理
+  return true;
 }
 
 /**
- * 浏览器端豆瓣分类数据获取函数 (近期热门)
+ * 浏览器端豆瓣分类数据获取函数
  */
 export async function fetchDoubanCategories(
   params: DoubanCategoriesParams
 ): Promise<DoubanResult> {
   const { kind, category, type, pageLimit = 20, pageStart = 0 } = params;
 
-  // 构造豆瓣移动端 H5 接口 URL
-  const target = `https://m.douban.com/rexxar/api/v2/subject/recent_hot/${kind}?start=${pageStart}&limit=${pageLimit}&category=${encodeURIComponent(category)}&type=${encodeURIComponent(type)}`;
+  // 验证参数
+  if (!['tv', 'movie'].includes(kind)) {
+    throw new Error('kind 参数必须是 tv 或 movie');
+  }
+
+  if (!category || !type) {
+    throw new Error('category 和 type 参数不能为空');
+  }
+
+  if (pageLimit < 1 || pageLimit > 100) {
+    throw new Error('pageLimit 必须在 1-100 之间');
+  }
+
+  if (pageStart < 0) {
+    throw new Error('pageStart 不能小于 0');
+  }
+
+  const target = `https://m.douban.com/rexxar/api/v2/subject/recent_hot/${kind}?start=${pageStart}&limit=${pageLimit}&category=${category}&type=${type}`;
 
   try {
-    const response = await fetchWithEdgeProxy(target);
+    const response = await fetchWithTimeout(target);
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! Status: ${response.status}`);
+    }
+
     const doubanData: DoubanCategoryApiResponse = await response.json();
 
-    const list: DoubanItem[] = (doubanData.items || []).map((item) => {
-      const originalPoster = item.pic?.normal || item.pic?.large || '';
-      return {
-        id: item.id,
-        title: item.title,
-        poster: proxyPosterUrl(originalPoster), // 拦截并启用 EdgeOne 图片代理
-        rate: item.rating?.value ? item.rating.value.toFixed(1) : '暂无',
-        year: item.card_subtitle?.match(/(\d{4})/)?.[1] || '',
-      };
-    });
+    // 转换数据格式
+    const list: DoubanItem[] = doubanData.items.map((item) => ({
+      id: item.id,
+      title: item.title,
+      poster: item.pic?.normal || item.pic?.large || '',
+      rate: item.rating?.value ? item.rating.value.toFixed(1) : '',
+      year: item.card_subtitle?.match(/(\d{4})/)?.[1] || '',
+    }));
 
-    return { code: 200, message: '获取成功', list };
+    return {
+      code: 200,
+      message: '获取成功',
+      list: list,
+    };
   } catch (error) {
+    // 触发全局错误提示
     if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('globalError', {
-        detail: { message: '获取豆瓣分类数据失败，请检查 EdgeOne 代理' }
-      }));
+      window.dispatchEvent(
+        new CustomEvent('globalError', {
+          detail: { message: '获取豆瓣分类数据失败' },
+        })
+      );
     }
-    throw error;
+    throw new Error(`获取豆瓣分类数据失败: ${(error as Error).message}`);
   }
 }
 
 /**
- * 获取豆瓣列表数据 (标签搜索版)
+ * 统一的豆瓣分类数据获取函数，根据代理设置选择使用服务端 API 或客户端代理获取
  */
-export async function fetchDoubanList(params: {
-  tag: string;
-  type: string;
-  pageLimit?: number;
-  pageStart?: number;
-}): Promise<DoubanResult> {
-  const { tag, type, pageLimit = 20, pageStart = 0 } = params;
-
-  // 统一改用更稳定的 H5 汇总接口
-  const target = `https://m.douban.com/rexxar/api/v2/subject_collection/filter_${type}_${encodeURIComponent(tag)}/items?start=${pageStart}&count=${pageLimit}`;
-
-  try {
-    const response = await fetchWithEdgeProxy(target);
-    const data = await response.json();
-
-    const list: DoubanItem[] = (data.items || []).map((item: any) => {
-      const originalPoster = item.pic?.normal || item.pic?.large || '';
-      return {
-        id: item.id,
-        title: item.title,
-        poster: proxyPosterUrl(originalPoster), // 拦截并启用 EdgeOne 图片代理
-        rate: item.rating?.value ? item.rating.value.toFixed(1) : '暂无',
-        year: item.year || item.card_subtitle?.match(/(\d{4})/)?.[1] || '',
-      };
-    });
-
-    return { code: 200, message: '获取成功', list };
-  } catch (error) {
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('globalError', {
-        detail: { message: '获取豆瓣列表数据失败' }
-      }));
-    }
-    throw error;
-  }
-}
-
-/**
- * 暴露给外部的统一接口
- */
-export async function getDoubanCategories(params: DoubanCategoriesParams): Promise<DoubanResult> {
+export async function getDoubanCategories(
+  params: DoubanCategoriesParams
+): Promise<DoubanResult> {
+  // 统一走客户端直连/代理
   return fetchDoubanCategories(params);
 }
 
-export async function getDoubanList(params: {
+interface DoubanListParams {
   tag: string;
   type: string;
   pageLimit?: number;
   pageStart?: number;
-}): Promise<DoubanResult> {
+}
+
+export async function getDoubanList(
+  params: DoubanListParams
+): Promise<DoubanResult> {
+  const { tag, type, pageLimit = 20, pageStart = 0 } = params;
+  // 统一走客户端直连/代理
   return fetchDoubanList(params);
 }
 
-export function shouldUseDoubanClient(): boolean {
-  return true;
+export async function fetchDoubanList(
+  params: DoubanListParams
+): Promise<DoubanResult> {
+  const { tag, type, pageLimit = 20, pageStart = 0 } = params;
+
+  // 验证参数
+  if (!tag || !type) {
+    throw new Error('tag 和 type 参数不能为空');
+  }
+
+  if (!['tv', 'movie'].includes(type)) {
+    throw new Error('type 参数必须是 tv 或 movie');
+  }
+
+  if (pageLimit < 1 || pageLimit > 100) {
+    throw new Error('pageLimit 必须在 1-100 之间');
+  }
+
+  if (pageStart < 0) {
+    throw new Error('pageStart 不能小于 0');
+  }
+
+  const target = `https://movie.douban.com/j/search_subjects?type=${type}&tag=${tag}&sort=recommend&page_limit=${pageLimit}&page_start=${pageStart}`;
+
+  try {
+    const response = await fetchWithTimeout(target);
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! Status: ${response.status}`);
+    }
+
+    const doubanData: DoubanCategoryApiResponse = await response.json();
+
+    // 转换数据格式
+    const list: DoubanItem[] = doubanData.items.map((item) => ({
+      id: item.id,
+      title: item.title,
+      poster: item.pic?.normal || item.pic?.large || '',
+      rate: item.rating?.value ? item.rating.value.toFixed(1) : '',
+      year: item.card_subtitle?.match(/(\d{4})/)?.[1] || '',
+    }));
+
+    return {
+      code: 200,
+      message: '获取成功',
+      list: list,
+    };
+  } catch (error) {
+    // 触发全局错误提示
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('globalError', {
+          detail: { message: '获取豆瓣列表数据失败' },
+        })
+      );
+    }
+    throw new Error(`获取豆瓣分类数据失败: ${(error as Error).message}`);
+  }
 }
