@@ -1,7 +1,10 @@
 import { DoubanItem, DoubanResult } from './types';
 
-// 你的 EdgeOne 边缘函数地址
-const EDGE_PROXY_BASE = 'https://doubandaili.gullu.cc.cd/api';
+// ==================== 配置区 ====================
+// 修正后的数据与图片代理基础域（移除旧版的代理地址拼凑）
+const EDGE_API_BASE = 'https://doubandali.gullu.cc.cd/api';
+const EDGE_IMG_BASE = 'https://doubandali.gullu.cc.cd/img/';
+// ===============================================
 
 interface DoubanCategoriesParams {
   kind: 'tv' | 'movie';
@@ -28,11 +31,12 @@ interface DoubanCategoryApiResponse {
 }
 
 /**
- * 封装经过 EdgeOne 代理的请求
- * 修复了 URL 拼接逻辑，确保格式为：代理地址/?url=编码后的目标地址
+ * 封装经过 EdgeOne 路径透明代理的请求
+ * 格式转换：https://m.douban.com/rexxar/api/... -> ${EDGE_API_BASE}/rexxar/api/...
  */
 async function fetchWithEdgeProxy(targetUrl: string): Promise<Response> {
-  const finalUrl = `${EDGE_PROXY_BASE}/?url=${encodeURIComponent(targetUrl)}`;
+  // 将原豆瓣移动端主域名，直接替换成我们的 EdgeOne 数据代理前缀
+  const finalUrl = targetUrl.replace('https://m.douban.com/rexxar/api', EDGE_API_BASE);
 
   const response = await fetch(finalUrl, {
     method: 'GET',
@@ -46,6 +50,16 @@ async function fetchWithEdgeProxy(targetUrl: string): Promise<Response> {
   }
 
   return response;
+}
+
+/**
+ * 助手函数：将豆瓣原始图片 URL 转换为走 EdgeOne 30天强缓存的代理 URL
+ * 兼容系统拼接，进行完整的 UrlEncode 编码
+ */
+function proxyPosterUrl(originalUrl: string): string {
+  if (!originalUrl) return '';
+  // 转换为：https://doubandali.gullu.cc.cd/img/https%3A%2F%2Fimg9.doubanio.com%2F...
+  return `${EDGE_IMG_BASE}${encodeURIComponent(originalUrl)}`;
 }
 
 /**
@@ -63,13 +77,16 @@ export async function fetchDoubanCategories(
     const response = await fetchWithEdgeProxy(target);
     const doubanData: DoubanCategoryApiResponse = await response.json();
 
-    const list: DoubanItem[] = (doubanData.items || []).map((item) => ({
-      id: item.id,
-      title: item.title,
-      poster: item.pic?.normal || item.pic?.large || '',
-      rate: item.rating?.value ? item.rating.value.toFixed(1) : '暂无',
-      year: item.card_subtitle?.match(/(\d{4})/)?.[1] || '',
-    }));
+    const list: DoubanItem[] = (doubanData.items || []).map((item) => {
+      const originalPoster = item.pic?.normal || item.pic?.large || '';
+      return {
+        id: item.id,
+        title: item.title,
+        poster: proxyPosterUrl(originalPoster), // 拦截并启用 EdgeOne 图片代理
+        rate: item.rating?.value ? item.rating.value.toFixed(1) : '暂无',
+        year: item.card_subtitle?.match(/(\d{4})/)?.[1] || '',
+      };
+    });
 
     return { code: 200, message: '获取成功', list };
   } catch (error) {
@@ -100,13 +117,16 @@ export async function fetchDoubanList(params: {
     const response = await fetchWithEdgeProxy(target);
     const data = await response.json();
 
-    const list: DoubanItem[] = (data.items || []).map((item: any) => ({
-      id: item.id,
-      title: item.title,
-      poster: item.pic?.normal || item.pic?.large || '',
-      rate: item.rating?.value ? item.rating.value.toFixed(1) : '暂无',
-      year: item.year || item.card_subtitle?.match(/(\d{4})/)?.[1] || '',
-    }));
+    const list: DoubanItem[] = (data.items || []).map((item: any) => {
+      const originalPoster = item.pic?.normal || item.pic?.large || '';
+      return {
+        id: item.id,
+        title: item.title,
+        poster: proxyPosterUrl(originalPoster), // 拦截并启用 EdgeOne 图片代理
+        rate: item.rating?.value ? item.rating.value.toFixed(1) : '暂无',
+        year: item.year || item.card_subtitle?.match(/(\d{4})/)?.[1] || '',
+      };
+    });
 
     return { code: 200, message: '获取成功', list };
   } catch (error) {
