@@ -2,7 +2,7 @@ import { DoubanItem, DoubanResult } from './types';
 
 // ==================== 配置区 ====================
 // 修正后的数据与图片代理基础域（移除旧版的代理地址拼凑）
-const EDGE_API_BASE = 'https://doubandali.gullu.cc.cd/api';
+const EDGE_API_BASE = 'https://doubandali.gullu.cc.cd/api/';
 const EDGE_IMG_BASE = 'https://doubandali.gullu.cc.cd/img/';
 // ===============================================
 
