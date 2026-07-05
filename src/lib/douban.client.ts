@@ -1,4 +1,5 @@
 import { DoubanItem, DoubanResult } from './types';
+import { getDoubanProxyUrl } from './utils';
 
 interface DoubanCategoriesParams {
   kind: 'tv' | 'movie';
@@ -24,135 +25,232 @@ interface DoubanCategoryApiResponse {
   }>;
 }
 
-// 🎯 维持你的数据代理网关（目前数据部分完全正常）
-const FIXED_DATA_PROXY = 'https://doubandali.gullu.cc.cd/api/';
-
 /**
- * 🛠️ 终极无感流：将原图包装进带有免签脱钩属性的 data:html 容器中
- * 这样前端的 <img> 标签直接吃这个 src，浏览器在渲染内部代码时会强制无来源直连豆瓣，彻底免疫 418！
+ * 带超时的 fetch 请求
  */
-function makeNoReferrerImage(rawUrl: string): string {
-  if (!rawUrl) return '';
-  
-  let targetUrl = rawUrl;
-  if (rawUrl.includes('%3A%2F%2F')) {
-    targetUrl = decodeURIComponent(rawUrl);
-  }
-  
-  // 提取纯净官方原图链接
-  if (targetUrl.includes('doubanio.com')) {
-    const match = targetUrl.match(/https?:\/\/[^\/]+.doubanio.com\/.*/);
-    if (match) targetUrl = match[0];
-  }
+const FALLBACK_CORS_PROXIES = [
+  'https://cors.isteed.cc/',
+  'https://cors.isteed.cc/https://',
+];
 
-  // 💡 核心黑科技：直接生成一段带有 never 策略的行内 SVG 图像流。
-  // 这样无论前端 <img> 组件怎么写，浏览器在解析这个数据流里的图片时，Referer 必然为空！
-  const svgHtml = `<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%">
-    <foreignObject width="100%" height="100%">
-      <div xmlns="http://www.w3.org/1999/xhtml" style="width:100%;height:100%;margin:0;padding:0;">
-        <style>img { width:100%; height:100%; object-fit:cover; display:block; }</style>
-        <img src="${targetUrl}" referrerpolicy="no-referrer" rel="noreferrer" />
-      </div>
-    </foreignObject>
-  </svg>`;
-
-  return `data:image/svg+xml;utf8,${encodeURIComponent(svgHtml)}`;
-}
-
-/**
- * 带超时的 fetch 请求（数据 API 专用透明中转）
- */
 async function fetchWithTimeout(
   url: string,
   options: RequestInit = {}
 ): Promise<Response> {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 10000);
+  const timeoutId = setTimeout(() => controller.abort(), 10000); // 10秒超时
 
-  let finalUrl = url;
-  if (url.startsWith('https://m.douban.com/rexxar/api/v2/')) {
-    finalUrl = url.replace('https://m.douban.com/rexxar/api/v2/', FIXED_DATA_PROXY);
-  } else if (url.startsWith('https://movie.douban.com/')) {
-    finalUrl = url.replace('https://movie.douban.com/', FIXED_DATA_PROXY);
-  }
+  // 检查是否使用代理
+  const proxyUrl = getDoubanProxyUrl();
+  const finalUrl = proxyUrl ? `${proxyUrl}${encodeURIComponent(url)}` : url;
 
   const fetchOptions: RequestInit = {
     ...options,
     signal: controller.signal,
     headers: {
+      // 浏览器受限请求头不强行设置，仅保留可允许的 Accept
       Accept: 'application/json, text/plain, */*',
       ...options.headers,
     },
   };
 
   try {
-    const response = await fetch(finalUrl, fetchOptions);
+    let response = await fetch(finalUrl, fetchOptions);
     clearTimeout(timeoutId);
+
+    // 如果被 CORS 限制（opaque 或非 2xx），并且未设置自有代理，则尝试公共 CORS 代理作为兜底
+    if ((response.type === 'opaque' || !response.ok) && !proxyUrl) {
+      for (const px of FALLBACK_CORS_PROXIES) {
+        try {
+          const resp = await fetch(
+            px.endsWith('https://') ? `${px}${url.replace(/^https?:\/\//, '')}` : `${px}${url}`,
+            fetchOptions
+          );
+          if (resp.ok && resp.type !== 'opaque') {
+            response = resp;
+            break;
+          }
+        } catch (_) {
+          // 继续尝试下一个
+        }
+      }
+    }
+
     return response;
   } catch (error) {
     clearTimeout(timeoutId);
+    // fetch 直接抛错（如被 CORS 拦截或网络失败）时，尝试公共代理兜底
+    if (!proxyUrl) {
+      for (const px of FALLBACK_CORS_PROXIES) {
+        try {
+          const resp = await fetch(
+            px.endsWith('https://') ? `${px}${url.replace(/^https?:\/\//, '')}` : `${px}${url}`,
+            fetchOptions
+          );
+          if (resp.ok && resp.type !== 'opaque') {
+            return resp;
+          }
+        } catch (_) {
+          // 继续尝试下一个
+        }
+      }
+    }
     throw error;
   }
 }
 
+/**
+ * 检查是否应该使用客户端获取豆瓣数据
+ */
 export function shouldUseDoubanClient(): boolean {
+  // 静态导出模式不提供服务端 API，统一使用客户端直连/代理
   return true;
 }
 
+/**
+ * 浏览器端豆瓣分类数据获取函数
+ */
 export async function fetchDoubanCategories(
   params: DoubanCategoriesParams
 ): Promise<DoubanResult> {
   const { kind, category, type, pageLimit = 20, pageStart = 0 } = params;
+
+  // 验证参数
+  if (!['tv', 'movie'].includes(kind)) {
+    throw new Error('kind 参数必须是 tv 或 movie');
+  }
+
+  if (!category || !type) {
+    throw new Error('category 和 type 参数不能为空');
+  }
+
+  if (pageLimit < 1 || pageLimit > 100) {
+    throw new Error('pageLimit 必须在 1-100 之间');
+  }
+
+  if (pageStart < 0) {
+    throw new Error('pageStart 不能小于 0');
+  }
+
   const target = `https://m.douban.com/rexxar/api/v2/subject/recent_hot/${kind}?start=${pageStart}&limit=${pageLimit}&category=${category}&type=${type}`;
 
   try {
     const response = await fetchWithTimeout(target);
-    if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! Status: ${response.status}`);
+    }
+
     const doubanData: DoubanCategoryApiResponse = await response.json();
 
-    const list: DoubanItem[] = (doubanData.items || []).map((item) => ({
+    // 转换数据格式
+    const list: DoubanItem[] = doubanData.items.map((item) => ({
       id: item.id,
       title: item.title,
-      poster: makeNoReferrerImage(item.pic?.normal || item.pic?.large || ''), // ✨ 注入免签外壳
+      poster: item.pic?.normal || item.pic?.large || '',
       rate: item.rating?.value ? item.rating.value.toFixed(1) : '',
       year: item.card_subtitle?.match(/(\d{4})/)?.[1] || '',
     }));
 
-    return { code: 200, message: '获取成功', list };
+    return {
+      code: 200,
+      message: '获取成功',
+      list: list,
+    };
   } catch (error) {
+    // 触发全局错误提示
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('globalError', {
+          detail: { message: '获取豆瓣分类数据失败' },
+        })
+      );
+    }
     throw new Error(`获取豆瓣分类数据失败: ${(error as Error).message}`);
   }
 }
 
-export async function getDoubanCategories(params: DoubanCategoriesParams): Promise<DoubanResult> {
+/**
+ * 统一的豆瓣分类数据获取函数，根据代理设置选择使用服务端 API 或客户端代理获取
+ */
+export async function getDoubanCategories(
+  params: DoubanCategoriesParams
+): Promise<DoubanResult> {
+  // 统一走客户端直连/代理
   return fetchDoubanCategories(params);
 }
 
-interface DoubanListParams { tag: string; type: string; pageLimit?: number; pageStart?: number; }
+interface DoubanListParams {
+  tag: string;
+  type: string;
+  pageLimit?: number;
+  pageStart?: number;
+}
 
-export async function getDoubanList(params: DoubanListParams): Promise<DoubanResult> {
+export async function getDoubanList(
+  params: DoubanListParams
+): Promise<DoubanResult> {
+  const { tag, type, pageLimit = 20, pageStart = 0 } = params;
+  // 统一走客户端直连/代理
   return fetchDoubanList(params);
 }
 
-export async function fetchDoubanList(params: DoubanListParams): Promise<DoubanResult> {
+export async function fetchDoubanList(
+  params: DoubanListParams
+): Promise<DoubanResult> {
   const { tag, type, pageLimit = 20, pageStart = 0 } = params;
+
+  // 验证参数
+  if (!tag || !type) {
+    throw new Error('tag 和 type 参数不能为空');
+  }
+
+  if (!['tv', 'movie'].includes(type)) {
+    throw new Error('type 参数必须是 tv 或 movie');
+  }
+
+  if (pageLimit < 1 || pageLimit > 100) {
+    throw new Error('pageLimit 必须在 1-100 之间');
+  }
+
+  if (pageStart < 0) {
+    throw new Error('pageStart 不能小于 0');
+  }
+
   const target = `https://movie.douban.com/j/search_subjects?type=${type}&tag=${tag}&sort=recommend&page_limit=${pageLimit}&page_start=${pageStart}`;
 
   try {
     const response = await fetchWithTimeout(target);
-    if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! Status: ${response.status}`);
+    }
+
     const doubanData: DoubanCategoryApiResponse = await response.json();
 
-    const list: DoubanItem[] = (doubanData.items || []).map((item) => ({
+    // 转换数据格式
+    const list: DoubanItem[] = doubanData.items.map((item) => ({
       id: item.id,
       title: item.title,
-      poster: makeNoReferrerImage(item.pic?.normal || item.pic?.large || ''), // ✨ 注入免签外壳
+      poster: item.pic?.normal || item.pic?.large || '',
       rate: item.rating?.value ? item.rating.value.toFixed(1) : '',
       year: item.card_subtitle?.match(/(\d{4})/)?.[1] || '',
     }));
 
-    return { code: 200, message: '获取成功', list };
+    return {
+      code: 200,
+      message: '获取成功',
+      list: list,
+    };
   } catch (error) {
-    throw new Error(`获取豆瓣列表数据失败: ${(error as Error).message}`);
+    // 触发全局错误提示
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('globalError', {
+          detail: { message: '获取豆瓣列表数据失败' },
+        })
+      );
+    }
+    throw new Error(`获取豆瓣分类数据失败: ${(error as Error).message}`);
   }
 }
